@@ -34,7 +34,9 @@ from wger.core.models import (
 )
 from wger.exercises.models import Exercise
 from wger.manager.consts import (
+    REP_UNIT_MAX_REPS,
     REP_UNIT_REPETITIONS,
+    REP_UNIT_TILL_FAILURE,
     REQUIREMENT_RULES,
     WEIGHT_UNIT_KG,
 )
@@ -414,7 +416,7 @@ class SlotEntry(models.Model):
 
         return any(all(rule_met(log, rule) for rule in requirements.rules) for log in log_data)
 
-    def get_config_data(self, iteration: int) -> SetConfigData:
+    def get_config_data(self, iteration: int, with_history: bool = True) -> SetConfigData:
         """
         Calculates the configuration for a given iteration of a slot entry.
 
@@ -423,6 +425,8 @@ class SlotEntry(models.Model):
         requirements only apply on iterations where a log of the previous
         iteration reaches the displayed prescription of all required fields,
         earning one application per qualifying iteration.
+
+        Without history the owner's logs are ignored.
         """
 
         # If there are no progressions, the value will be always the same
@@ -435,7 +439,11 @@ class SlotEntry(models.Model):
         # routine's owner. The API ownership check should already prevent
         # cross-user logs from being attached to a slot entry, but this
         # filter ensures progression calculations stay user-scoped.
-        logs = list(self.workoutlog_set.filter(user=self.slot.day.routine.user))
+        logs = (
+            list(self.workoutlog_set.filter(user=self.slot.day.routine.user))
+            if with_history
+            else []
+        )
 
         # If there is a custom class set, pass all responsibilities to it
         if self.class_name:
@@ -459,7 +467,9 @@ class SlotEntry(models.Model):
                 max_rir_configs=self.maxrirconfig_set.filter(iteration__lte=iteration),
                 rest_configs=self.restconfig_set.filter(iteration__lte=iteration),
                 max_rest_configs=self.maxrestconfig_set.filter(iteration__lte=iteration),
-                logs=self.workoutlog_set.filter(iteration__lte=iteration),
+                logs=self.workoutlog_set.filter(iteration__lte=iteration)
+                if with_history
+                else WorkoutLog.objects.none(),
             )
 
             return custom_logic.calculate()
@@ -536,6 +546,12 @@ class SlotEntry(models.Model):
         rest = states['rest'].value
         max_rest = states['maxrest'].value
 
+        # "Until Failure" and "Max Reps" don't need a repetitions value
+        has_repetitions_unit = repetitions is not None or self.repetition_unit_id in (
+            REP_UNIT_TILL_FAILURE,
+            REP_UNIT_MAX_REPS,
+        )
+
         result = SetConfigData(
             slot_entry_id=self.id,
             exercise=self.exercise_id,
@@ -557,9 +573,9 @@ class SlotEntry(models.Model):
             if max_repetitions and repetitions and max_repetitions > repetitions
             else None,
             repetitions_rounding=self.repetition_rounding if repetitions is not None else None,
-            repetitions_unit=self.repetition_unit_id if repetitions is not None else None,
+            repetitions_unit=self.repetition_unit_id if has_repetitions_unit else None,
             repetitions_unit_name=self.repetition_unit.name
-            if repetitions is not None and self.repetition_unit is not None
+            if has_repetitions_unit and self.repetition_unit is not None
             else None,
             rir=round_value(rir, self._display_rounding('rir')),
             max_rir=round_value(max_rir, self._display_rounding('rir'))

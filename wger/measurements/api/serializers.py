@@ -15,6 +15,8 @@
 
 # Standard Library
 import json
+import uuid
+from collections.abc import Mapping
 from decimal import Decimal
 
 # Third Party
@@ -57,6 +59,22 @@ def validate_json_object(value, field: str, max_bytes: int):
     return value
 
 
+def context_user_id(context: dict) -> int | None:
+    """
+    Returns the id of the user a serializer writes for.
+
+    The owner is not part of the payload, it is passed to save() by the
+    viewset (as a request) or by the PowerSync handler (as a context value).
+    """
+    user_id = context.get('user_id')
+    if user_id is not None:
+        return user_id
+
+    request = context.get('request')
+    user = getattr(request, 'user', None) if request else None
+    return user.pk if user is not None and user.is_authenticated else None
+
+
 class CategorySerializer(serializers.ModelSerializer):
     """
     Measurement category serializer
@@ -78,6 +96,44 @@ class CategorySerializer(serializers.ModelSerializer):
             'dynamic_params',
         )
         read_only_fields = ('is_official',)
+
+    def to_internal_value(self, data):
+        """
+        Refuses a derived key before the field validators run: the uniqueness
+        check of the id would otherwise tell whether another user has a
+        category of that type
+        """
+        self._validate_derived_id(data)
+        return super().to_internal_value(data)
+
+    def _validate_derived_id(self, data):
+        """
+        A derived key (Category.deterministic_id) is only accepted for the typed
+        category of the writing user it is derived for. Anyone can compute the
+        keys of other users, so taking one would block their category.
+        """
+        if not isinstance(data, Mapping) or 'id' not in data:
+            return
+        try:
+            key = uuid.UUID(str(data['id']))
+        except ValueError:
+            return
+        if key.version != 5 or (self.instance is not None and key == self.instance.pk):
+            return
+
+        metric_type = data.get(
+            'metric_type',
+            self.instance.metric_type if self.instance else MetricType.CUSTOM,
+        )
+        user_id = self._get_user_id()
+        if (
+            user_id is not None
+            and Category.has_deterministic_id(metric_type)
+            and key == Category.deterministic_id(user_id, metric_type)
+        ):
+            return
+
+        raise serializers.ValidationError({'id': 'This id is reserved for a typed category'})
 
     def validate_chart_config(self, chart_config):
         """
@@ -249,17 +305,8 @@ class CategorySerializer(serializers.ModelSerializer):
     def _get_user_id(self):
         """
         Returns the id of the user the category belongs to.
-
-        The owner is not part of the payload, it is passed to save() by the
-        viewset (as a request) or by the PowerSync handler (as a context value).
         """
-        user_id = self.context.get('user_id')
-        if user_id is not None:
-            return user_id
-
-        request = self.context.get('request')
-        user = getattr(request, 'user', None) if request else None
-        return user.pk if user is not None and user.is_authenticated else None
+        return context_user_id(self.context)
 
     def create(self, validated_data):
         """
@@ -303,11 +350,22 @@ class MeasurementSerializer(serializers.ModelSerializer):
         coerce_to_string=False,
     )
 
+    # Addresses the category by its type instead of its id, so that an
+    # integration does not have to look it up first
+    metric_type = serializers.ChoiceField(
+        choices=MetricType.choices,
+        write_only=True,
+        required=False,
+        help_text='Alternative to category when writing: the category of this type of the '
+        'user. It has to exist, custom and group types are not accepted.',
+    )
+
     class Meta:
         model = Measurement
         fields = (
             'id',
             'category',
+            'metric_type',
             'date',
             'value',
             'notes',
@@ -315,6 +373,51 @@ class MeasurementSerializer(serializers.ModelSerializer):
             'external_id',
             'extra_data',
         )
+        # Either this or metric_type, see to_internal_value()
+        extra_kwargs = {
+            'category': {
+                'required': False,
+                'help_text': 'When writing, either this or metric_type is required.',
+            },
+        }
+
+    def to_internal_value(self, data):
+        """
+        Resolves metric_type to the user's category of that type.
+
+        Done here and not in validate(): the validator of the external_id
+        constraint runs in between and needs the category. It also reports a
+        create that names neither.
+        """
+        attrs = super().to_internal_value(data)
+        metric_type = attrs.pop('metric_type', None)
+        if metric_type is None:
+            return attrs
+
+        # Free-form categories share the type, it does not identify one
+        if metric_type == MetricType.CUSTOM:
+            raise serializers.ValidationError(
+                {'metric_type': 'Free-form categories can only be addressed by their id'}
+            )
+
+        category = Category.objects.filter(
+            user_id=context_user_id(self.context),
+            metric_type=metric_type,
+        ).first()
+        if category is None:
+            raise serializers.ValidationError(
+                {'metric_type': f'You have no {metric_type} category'}
+            )
+        if attrs.get('category', category) != category:
+            raise serializers.ValidationError(
+                {'metric_type': 'Does not match the metric type of the category'}
+            )
+
+        try:
+            attrs['category'] = self.validate_category(category)
+        except serializers.ValidationError as e:
+            raise serializers.ValidationError({'metric_type': e.detail})
+        return attrs
 
     def validate_category(self, category):
         """

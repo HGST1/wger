@@ -16,10 +16,7 @@
 from django.core.exceptions import ValidationError
 
 # Third Party
-from PIL import (
-    Image,
-    UnidentifiedImageError,
-)
+from PIL import Image
 
 
 MAX_FILE_SIZE_MB = 20
@@ -37,8 +34,15 @@ def validate_image_static_no_animation(value):
         value.open()
         img = Image.open(value)
         img_format = img.format.lower()
-    except UnidentifiedImageError:
+    except Image.DecompressionBombError:
+        raise ValidationError('The image dimensions are too large.')
+    except OSError:
+        # Unidentified as well as cut off within the header
         raise ValidationError('File is not a valid image.')
+
+    # Pillow only raises above twice its limit, below that it just warns
+    if img.width * img.height > Image.MAX_IMAGE_PIXELS:
+        raise ValidationError('The image dimensions are too large.')
 
     # Supported types
     if img_format not in IMAGE_ALLOWED_FORMATS:
@@ -47,5 +51,5 @@ def validate_image_static_no_animation(value):
         )
 
     # Check for animation
-    if img_format in ('webp', 'avif') and getattr(img, 'is_animated'):
+    if img_format in ('png', 'webp', 'avif') and getattr(img, 'is_animated'):
         raise ValidationError('Animated images are not supported.')

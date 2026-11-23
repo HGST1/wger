@@ -1,56 +1,52 @@
+# This file is part of wger Workout Manager.
+#
+# wger Workout Manager is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# wger Workout Manager is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+
 # Standard Library
 from unittest.mock import patch
 
 # Django
-from django.test import SimpleTestCase
+from django.test import (
+    SimpleTestCase,
+    override_settings,
+)
 
 # wger
 from wger.utils.requests import (
-    get_all_paginated,
-    get_paginated,
-    wger_headers,
-    wger_user_agent,
+    WgerTimeoutSession,
+    wger_request_timeout,
 )
 
 
-class RequestsUtilsTestCase(SimpleTestCase):
-    @patch('wger.utils.requests.requests.get')
-    def test_get_all_paginated_follows_next_links(self, get_mock):
-        get_mock.side_effect = [
-            MockResponse({'results': [1, 2], 'next': 'https://example.com/page-2'}),
-            MockResponse({'results': [3], 'next': None}),
-        ]
-
-        results = get_all_paginated('https://example.com/page-1')
-
-        self.assertEqual(results, [1, 2, 3])
-        self.assertEqual(get_mock.call_count, 2)
-        get_mock.assert_any_call('https://example.com/page-1', headers={})
-        get_mock.assert_any_call('https://example.com/page-2', headers={})
-
-    @patch('wger.utils.requests.requests.get')
-    def test_get_paginated_yields_results_and_passes_headers(self, get_mock):
-        get_mock.side_effect = [
-            MockResponse({'results': ['a'], 'next': 'page-2'}),
-            MockResponse({'results': ['b'], 'next': None}),
-        ]
-        headers = {'Authorization': 'Bearer token'}
-
-        self.assertEqual(
-            list(get_paginated('page-1', headers=headers)),
-            ['a', 'b'],
-        )
-        get_mock.assert_any_call('page-1', headers=headers)
-        get_mock.assert_any_call('page-2', headers=headers)
-
-    def test_wger_headers_contains_user_agent(self):
-        self.assertEqual(wger_headers(), {'User-Agent': wger_user_agent()})
-        self.assertTrue(wger_user_agent().startswith('wger/'))
+class WgerRequestTimeoutTestCase(SimpleTestCase):
+    @override_settings(WGER_REQUEST_TIMEOUT=123)
+    def test_read_timeout_from_settings(self):
+        """The read timeout comes from WGER_REQUEST_TIMEOUT, the connect timeout is fixed"""
+        self.assertEqual(wger_request_timeout(), (10, 123))
 
 
-class MockResponse:
-    def __init__(self, data):
-        self.data = data
+class WgerTimeoutSessionTestCase(SimpleTestCase):
+    @override_settings(WGER_REQUEST_TIMEOUT=123)
+    @patch('requests.Session.request')
+    def test_default_timeout(self, mock_request):
+        """Requests without a timeout get wger_request_timeout()"""
+        WgerTimeoutSession().get('https://example.com')
 
-    def json(self):
-        return self.data
+        self.assertEqual(mock_request.call_args.kwargs['timeout'], (10, 123))
+
+    @patch('requests.Session.request')
+    def test_explicit_timeout_is_kept(self, mock_request):
+        """A timeout passed by the caller is not overwritten"""
+        WgerTimeoutSession().get('https://example.com', timeout=3)
+
+        self.assertEqual(mock_request.call_args.kwargs['timeout'], 3)
